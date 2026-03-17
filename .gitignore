@@ -1,27 +1,21 @@
-# Environment variables
-.env
-.env.local
-.env.*.local
-
-# Dependencies
-node_modules/
-*/node_modules/
-
-# Build outputs
-dist/
-build/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
 *.log
+.venv/
+venv/
+env/
 
-# OS files
+# Playwright / browsers
+ms-playwright/
+
+# Runtime downloads (generated PDFs)
+downloads/
+
+# OS / editor
 .DS_Store
 Thumbs.db
-
-# IDE
 .vscode/
-.idea/
-*.swp
-*.swo
 
-# Temporary files
-*.tmp
-.cache/
