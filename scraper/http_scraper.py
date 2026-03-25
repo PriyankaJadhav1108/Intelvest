@@ -4,6 +4,7 @@ Scrapes press release and presentation PDF links from an IR page using
 plain HTTP (httpx) + BeautifulSoup, without Playwright.
 """
 
+import re
 from collections import deque
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urljoin, urlparse
@@ -17,6 +18,8 @@ PRESS_RELEASE_KEYWORDS = [
     "press-release",
     "news release",
     "media release",
+    "earnings release",
+    "release",
     "newsroom",
     "news",
     "announcements",
@@ -42,6 +45,15 @@ PRESENTATION_KEYWORDS = [
     "conference",
     "roadshow",
     "analyst",
+]
+
+# Keywords that identify a transcript link
+TRANSCRIPT_KEYWORDS = [
+    "transcript",
+    "earnings call transcript",
+    "conference call transcript",
+    "webcast transcript",
+    "audio transcript",
 ]
 
 
@@ -70,6 +82,8 @@ def _classify_link(text: str, href: str) -> str:
         return "press_release"
     if any(kw in combined for kw in WEBCAST_KEYWORDS) or _is_audio_href(href):
         return "webcast"
+    if any(kw in combined for kw in TRANSCRIPT_KEYWORDS):
+        return "transcript"
     if any(kw in combined for kw in PRESENTATION_KEYWORDS):
         return "presentation"
     if _is_pdf_href(href):
@@ -77,16 +91,74 @@ def _classify_link(text: str, href: str) -> str:
     return "unknown"
 
 
-def _should_follow_link(text: str, href: str) -> Optional[str]:
+def _extract_json_links(json_text: str, base_url: str) -> List[Dict]:
+    """Scan JSON/text for URLs that likely reference PDF/audio, and classify them."""
+    candidates: List[Dict] = []
+    # URL pattern anywhere in JSON/script content
+    url_pattern = re.compile(r'(https?://[^"]+\.(pdf|mp3|m4a|wav)(?:\?[^"\s]*)?)', re.IGNORECASE)
+    for m in url_pattern.finditer(json_text):
+        url = m.group(1)
+        kind = _classify_link("", url)
+        if kind != "unknown":
+            candidates.append({"title": url.split("/")[-1], "link": url, "item_type": kind})
+
+    # Detect non-absolute pdf paths in JSON (e.g., "/content/.../file.pdf")
+    rel_pattern = re.compile(r"([\"'])(/[^\"']+?\.(pdf|mp3|m4a|wav))(\1)", re.IGNORECASE)
+    for m in rel_pattern.finditer(json_text):
+        rel = m.group(2)
+        url = urljoin(base_url, rel)
+        kind = _classify_link("", url)
+        if kind != "unknown":
+            candidates.append({"title": rel.split("/")[-1], "link": url, "item_type": kind})
+
+    return candidates
+
+
+def _extract_js_links(soup: BeautifulSoup, base_url: str) -> List[Dict]:
+    """
+    Extract document links from JavaScript code in script tags.
+    Looks for JSON objects or URL patterns in scripts.
+    """
+    js_links = []
+    for script in soup.find_all('script'):
+        if script.string:
+            # Look for JSON-like objects in script
+            json_matches = re.findall(r'\{[^}]*"[^"]*"(?:[^}]*"[^"]*")*[^}]*\}', script.string)
+            for match in json_matches:
+                try:
+                    import json
+                    data = json.loads(match)
+                    if isinstance(data, dict):
+                        # Look for URL fields
+                        for key, value in data.items():
+                            if isinstance(value, str) and (value.endswith('.pdf') or 'download' in value.lower()):
+                                url = urljoin(base_url, value)
+                                title = key.replace('_', ' ').title()
+                                js_links.append({"title": title, "link": url, "item_type": _classify_link(title, url)})
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            
+            # Also look for direct URL patterns in script
+            url_patterns = re.findall(r'https?://[^\s"\'<>]+(?:\.pdf|\.mp3|\.m4a)', script.string)
+            for url in url_patterns:
+                title = url.split('/')[-1]
+                js_links.append({"title": title, "link": url, "item_type": _classify_link(title, url)})
+    
+    return js_links
+
+
+def _classify_section_hint(text: str, href: str) -> Optional[str]:
     """
     Return an item_type hint ('press_release'|'presentation') if this looks like
     a relevant section page worth crawling; otherwise None.
     """
     combined = (text + " " + href).lower()
     # strong section hints
-    if any(k in combined for k in ["events", "presentations", "webcasts", "slides", "earnings", "quarterly"]):
+    if any(k in combined for k in ["events", "presentations", "webcasts", "slides", "earnings", "quarterly", 
+                                    "press", "news", "releases", "documents", "filings", "sec", "reports",
+                                    "results", "conference", "call", "investor-day", "annual-meeting"]):
         return "presentation"
-    if any(k in combined for k in ["press", "press releases", "news", "newsroom", "announcements"]):
+    if any(k in combined for k in ["press", "press releases", "news", "newsroom", "announcements", "media"]):
         return "press_release"
     # fallback to classifier
     t = _classify_link(text, href)
@@ -127,8 +199,8 @@ async def scrape_ir_page_http(ir_url: str) -> List[Dict]:
     q: deque[Tuple[str, int, Optional[str]]] = deque()
     q.append((ir_url, 0, None))
 
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
-        while q and len(visited_pages) < 12 and len(results) < 300:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=15) as client:
+        while q and len(visited_pages) < 12 and len(results) < 200:
             url, depth, hint = q.popleft()
             if url in visited_pages:
                 continue
@@ -144,6 +216,7 @@ async def scrape_ir_page_http(ir_url: str) -> List[Dict]:
 
             soup = BeautifulSoup(resp.text, "html.parser")
 
+            # Extract links from HTML
             for a in soup.find_all("a", href=True):
                 href_raw = a["href"].strip()
                 href = urljoin(url, href_raw)
@@ -166,6 +239,11 @@ async def scrape_ir_page_http(ir_url: str) -> List[Dict]:
                     or "download" in combined
                     or "presentation" in combined
                     or "slides" in combined
+                    or "earnings" in combined
+                    or "webcast" in combined
+                    or "transcript" in combined
+                    or "press" in combined
+                    or "release" in combined
                     or _is_audio_href(href)
                 )
                 if item_type != "unknown" and is_doc_candidate:
@@ -178,10 +256,40 @@ async def scrape_ir_page_http(ir_url: str) -> List[Dict]:
                     )
 
                 # Follow likely section pages to discover PDFs
-                if depth < 2 and _same_site(href):
-                    t_hint = _should_follow_link(text, href)
+                if depth < 3 and _same_site(href):
+                    t_hint = _classify_section_hint(text, href)
                     if t_hint:
                         q.append((href, depth + 1, t_hint))
+
+            # Extract links from JavaScript code
+            js_links = _extract_js_links(soup, url)
+            for link in js_links:
+                href = link["link"]
+                if href not in seen_links:
+                    seen_links.add(href)
+                    results.append(link)
+
+            # For JS-heavy pages, also inspect embedded JSON / script blobs for document URLs.
+            for script in soup.find_all("script"):
+                script_text = script.string or ""
+                if not script_text.strip():
+                    continue
+                for candidate in _extract_json_links(script_text, url):
+                    cand_href = candidate["link"]
+                    if cand_href not in seen_links and _same_site(cand_href):
+                        seen_links.add(cand_href)
+                        results.append(candidate)
+
+            # For server-side key-value JSON blobs in scripts, check for link arrays.
+            for script in soup.find_all("script", type=["application/json", "application/ld+json"]):
+                script_text = script.string or ""
+                if not script_text.strip():
+                    continue
+                for candidate in _extract_json_links(script_text, url):
+                    cand_href = candidate["link"]
+                    if cand_href not in seen_links and _same_site(cand_href):
+                        seen_links.add(cand_href)
+                        results.append(candidate)
 
     return results
 

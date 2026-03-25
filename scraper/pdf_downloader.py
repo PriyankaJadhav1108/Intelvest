@@ -48,7 +48,7 @@ async def _download_maybe_pdf(url: str, output_path: Path, filename: str) -> Opt
             "Chrome/122.0.0.0 Safari/537.36"
         )
     }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
         async with client.stream("GET", url, headers=headers) as response:
             if response.status_code != 200:
                 print(f"[pdf_downloader] HTTP {response.status_code} for {url}")
@@ -119,7 +119,7 @@ async def _download_direct_pdf(url: str, output_path: Path, filename: str) -> Op
             "Chrome/122.0.0.0 Safari/537.36"
         )
     }
-    async with httpx.AsyncClient(follow_redirects=True, timeout=60) as client:
+    async with httpx.AsyncClient(follow_redirects=True, timeout=20) as client:
         async with client.stream("GET", url, headers=headers) as response:
             if response.status_code != 200:
                 print(f"[pdf_downloader] HTTP {response.status_code} for {url}")
@@ -137,7 +137,7 @@ async def _download_direct_pdf(url: str, output_path: Path, filename: str) -> Op
 
 async def _print_page_to_pdf(page: Page, url: str, output_path: Path, filename: str) -> Optional[str]:
     """Use Playwright's built-in PDF printer to render an HTML page as PDF."""
-    await page.goto(url, wait_until="networkidle", timeout=40_000)
+    await page.goto(url, wait_until="networkidle", timeout=15_000)
     # Scroll so content loads
     for _ in range(3):
         await page.evaluate("window.scrollBy(0, window.innerHeight)")

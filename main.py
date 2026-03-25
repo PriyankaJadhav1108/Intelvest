@@ -13,12 +13,12 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from playwright.async_api import async_playwright
 
-from models import ScrapeRequest, ScrapeResponse, IRItem, ItemType
+from models import ScrapeRequest, ScrapeResponse, IRItem, ItemType, QuarterlyDocs, YearlyData
 from scraper.http_scraper import scrape_ir_page_http
 from scraper.playwright_scraper import scrape_ir_page
 from scraper.pdf_downloader import download_or_print_pdf, DOWNLOADS_DIR
@@ -48,7 +48,7 @@ async def serve_ui():
 
 
 @app.post("/scrape", response_model=ScrapeResponse)
-async def scrape(request: ScrapeRequest):
+async def scrape(request: ScrapeRequest, req: Request):
     """
     Full pipeline:
     1. Discover the IR page from the company URL
@@ -64,7 +64,7 @@ async def scrape(request: ScrapeRequest):
 
     # ── Helpers for filtering by year / quarter ─────────────────────────
 
-    TARGET_YEARS = {2023, 2024, 2025}
+    TARGET_YEARS = {2023, 2024, 2025, 2026}
     TARGET_QUARTERS = {1, 2, 3, 4}
 
     quarter_year_patterns = [
@@ -119,27 +119,73 @@ async def scrape(request: ScrapeRequest):
                 y = int(y_str)
             if y in TARGET_YEARS and q in TARGET_QUARTERS:
                 return y, q
+        # Fallback: find a year with month/quarter terms if possible
+        year_match = re.search(r"\b(2023|2024|2025|2026)\b", s)
+        if year_match:
+            year = int(year_match.group(1))
+
+            month_map = {
+                'jan': 1, 'feb': 1, 'mar': 1,
+                'apr': 2, 'may': 2, 'jun': 2,
+                'jul': 3, 'aug': 3, 'sep': 3,
+                'oct': 4, 'nov': 4, 'dec': 4,
+            }
+
+            # month name + year (January 2024, Jan 2025)
+            m = re.search(r"\b(january|february|march|april|may|june|july|august|september|october|november|december|jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\s+(2023|2024|2025|2026)\b", s)
+            if m:
+                q = month_map.get(m.group(1)[:3])
+                if q:
+                    return year, q
+
+            # date numerical patterns (2024-03-15, 03/15/2024)
+            m = re.search(r"\b(2023|2024|2025|2026)[\/-](\d{1,2})[\/-](\d{1,2})\b", s)
+            if m:
+                month_num = int(m.group(2))
+                if 1 <= month_num <= 12:
+                    return year, (month_num - 1) // 3 + 1
+
+            m = re.search(r"\b(\d{1,2})[\/-](\d{1,2})[\/-](2023|2024|2025|2026)\b", s)
+            if m:
+                month_num = int(m.group(1))
+                if 1 <= month_num <= 12:
+                    return year, (month_num - 1) // 3 + 1
+
+            for mname, q in month_map.items():
+                if mname in s:
+                    return year, q
+
+            # explicit quarter patterns
+            for q in [1, 2, 3, 4]:
+                if re.search(rf"\bq{q}\b|\b{q}.*q(uarter)?\b", s):
+                    return year, q
+
+            # special keywords fallback
+            if 'proxy' in s:
+                return year, 2
+            if any(kw in s for kw in ['earnings', 'earnings call', 'quarterly results']):
+                return year, 4
+            if any(kw in s for kw in ['annual', 'annual meeting', 'annual shareholder']):
+                return year, 4
+
+            return year, 1
         return None
 
     ir_domain = urlparse(ir_url).netloc
 
     def _is_target_period(raw: Dict) -> bool:
         """
-        Keep only PDFs for 2023–2025 Q1–Q4 based on title or link.
-        For Uber (investor.uber.com) we enforce this filter strictly.
-        For other IR sites, we accept all items and only use this
-        information for prioritization.
+        Keep only PDFs for 2023–2026 Q1–Q4 based on title or link.
+        Reject anything before 2023.
         """
         title = (raw.get("title") or "").lower()
         link = (raw.get("link") or "").lower()
-        if _parse_year_quarter(title) or _parse_year_quarter(link):
-            return True
-        # Only enforce the strict filter on Uber's IR domain
-        if ir_domain == "investor.uber.com":
-            return False
-        # For other domains, don't filter items out solely due to
-        # missing explicit quarter/year text.
-        return True
+        yq = _parse_year_quarter(title) or _parse_year_quarter(link)
+        if yq:
+            year, quarter = yq
+            if year >= 2023 and year <= 2026 and quarter in (1, 2, 3, 4):
+                return True
+        return False
 
     def _priority(raw: Dict) -> int:
         link = (raw.get("link") or "").lower()
@@ -166,118 +212,143 @@ async def scrape(request: ScrapeRequest):
         try:
             return await asyncio.wait_for(
                 download_or_print_pdf(page=page, url=raw["link"], title=raw["title"]),
-                timeout=45,
+                timeout=20,
             )
         except Exception:
             return None
 
+    def _create_item(raw: Dict, pdf_url: str | None = None, pdf_path: str | None = None) -> IRItem:
+        """Helper to create IRItem with parsed year/quarter"""
+        yq = _parse_year_quarter(raw.get("title", "") + " " + raw.get("link", ""))
+        year, quarter = yq if yq else (None, None)
+        return IRItem(
+            title=raw["title"],
+            link=raw["link"],
+            item_type=ItemType(raw.get("item_type", "unknown")),
+            pdf_path=pdf_path,
+            pdf_url=pdf_url,
+            parsed_year=year,
+            parsed_quarter=quarter,
+        )
+
     # ── Scrape + download PDFs (prefer Playwright; fallback to HTTP) ─────
     items: List[IRItem] = []
     used_playwright = False
-    max_downloads = 50  # allow up to 50 unique quarterly PDFs
+    playwright_error = None
+    max_downloads = 100  # allow up to 100 unique quarterly documents
     seen_links: set[str] = set()
 
+    # Try Playwright first; fallback to HTTP scraper on failure
+    raw_items: List[Dict] = []
     try:
         async with async_playwright() as pw:
             browser = await pw.chromium.launch(headless=True)
-            context = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/122.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 900},
-            )
+            context = await browser.new_context()
             page = await context.new_page()
             raw_items = await scrape_ir_page(page, ir_url)
-            used_playwright = True
-
-            # Prefer target 2023–2025 Q1–Q4 items; if none, fall back to all.
-            filtered = [r for r in raw_items if _is_target_period(r)]
-            if filtered:
-                raw_items = filtered
-            raw_items = sorted(raw_items, key=_priority)
-
-            for raw in raw_items:
-                if len(items) >= max_downloads:
-                    break
-                norm_link = (raw.get("link") or "").split("#", 1)[0]
-                if norm_link in seen_links:
-                    continue
-                # Webcasts: return the streaming URL directly (no PDF required)
-                if raw.get("item_type") == "webcast":
-                    seen_links.add(norm_link)
-                    items.append(
-                        IRItem(
-                            title=raw["title"],
-                            link=raw["link"],
-                            item_type=ItemType.webcast,
-                            pdf_path=None,
-                            pdf_url=raw["link"],
-                        )
-                    )
-                    continue
-
-                filename = await _download_one(page, raw)
-                if not filename:
-                    continue
-                seen_links.add(norm_link)
-                items.append(
-                    IRItem(
-                        title=raw["title"],
-                        link=raw["link"],
-                        item_type=ItemType(raw["item_type"]),
-                        pdf_path=filename,
-                        pdf_url=f"/downloads/{filename}",
-                    )
-                )
-
-            await page.close()
             await browser.close()
-    except Exception:
+        used_playwright = True
+        playwright_error = None
+        print("[INFO] Playwright scraping used")
+    except Exception as ex:
+        used_playwright = False
+        playwright_error = f"Playwright failed: {ex}. Falling back to HTTP scraper."
+        print(f"[WARN] {playwright_error}")
         raw_items = await scrape_ir_page_http(ir_url)
-        filtered = [r for r in raw_items if _is_target_period(r)]
-        if filtered:
-            raw_items = filtered
-        raw_items = sorted(raw_items, key=_priority)
-        for raw in raw_items:
-            if len(items) >= max_downloads:
-                break
-            norm_link = (raw.get("link") or "").split("#", 1)[0]
-            if norm_link in seen_links:
-                continue
-            if raw.get("item_type") == "webcast":
-                seen_links.add(norm_link)
-                items.append(
-                    IRItem(
-                        title=raw["title"],
-                        link=raw["link"],
-                        item_type=ItemType.webcast,
-                        pdf_path=None,
-                        pdf_url=raw["link"],
-                    )
-                )
-                continue
 
-            filename = await _download_one(None, raw)
-            if not filename:
-                continue
+    filtered = [r for r in raw_items if _is_target_period(r)]
+    if filtered:
+        raw_items = filtered
+    raw_items = sorted(raw_items, key=_priority)
+    
+    for raw in raw_items:
+        if len(items) >= max_downloads:
+            break
+        norm_link = (raw.get("link") or "").split("#", 1)[0]
+        if norm_link in seen_links:
+            continue
+
+        pdf_url = None
+        pdf_path = None
+
+        if raw.get("item_type") == "webcast":
+            # Webcast links are not downloaded as PDFs. Keep the link only.
             seen_links.add(norm_link)
-            items.append(
-                IRItem(
-                    title=raw["title"],
-                    link=raw["link"],
-                    item_type=ItemType(raw["item_type"]),
-                    pdf_path=filename,
-                    pdf_url=f"/downloads/{filename}",
-                )
-            )
+            items.append(_create_item(raw, pdf_url=raw.get("link"), pdf_path=None))
+            continue
+
+        # determine if this link is PDF-like, to preserve previous behavior
+        link_lower = (raw.get("link") or "").lower()
+        is_pdf_link = link_lower.endswith(".pdf") or ".pdf" in link_lower
+
+        if is_pdf_link:
+            filename = await _download_one(None, raw)
+            if filename:
+                pdf_url = f"/downloads/{filename}"
+                pdf_path = filename
+
+        # Always append the item, even when downloading fails or is not a PDF
+        seen_links.add(norm_link)
+        items.append(_create_item(raw, pdf_url=pdf_url, pdf_path=pdf_path))
+
+    # Build the years structure with default empty quarters (2023-2026)
+    years_dict: Dict[int, Dict[str, QuarterlyDocs]] = {
+        y: {f"quarter{i}": QuarterlyDocs() for i in range(1, 5)}
+        for y in range(2023, 2027)
+    }
+
+    base_url = str(req.base_url).rstrip("/")
+
+    def _resolve_link(pdf_url: str | None, link: str) -> str:
+        if pdf_url and pdf_url.startswith("/downloads/"):
+            return f"{base_url}{pdf_url}"
+        return pdf_url or link
+
+    def _make_title(year: int, quarter: int, doc_type: str, original_title: str) -> str:
+        """Generate explicit title with quarter/year like 'Q1 2025 - Presentation'"""
+        type_map = {
+            "presentation": "Presentation",
+            "press_release": "Press Release",
+            "webcast": "Webcast",
+            "transcript": "Transcript",
+        }
+        type_name = type_map.get(doc_type, doc_type.title())
+        return f"Q{quarter} {year} - {type_name}"
+
+    for item in items:
+        # Use already-parsed year/quarter from item
+        if item.parsed_year is None or item.parsed_quarter is None:
+            continue
+        year, quarter = item.parsed_year, item.parsed_quarter
+        if year < 2023 or year > 2026 or quarter not in (1, 2, 3, 4):
+            continue
+
+        quarter_key = f"quarter{quarter}"
+        docs = years_dict[year][quarter_key]
+
+        if item.item_type == ItemType.presentation:
+            docs.slides = _resolve_link(item.pdf_url, item.link)
+            docs.slides_title = _make_title(year, quarter, "presentation", item.title)
+        elif item.item_type == ItemType.press_release:
+            docs.press_release = _resolve_link(item.pdf_url, item.link)
+            docs.press_release_title = _make_title(year, quarter, "press_release", item.title)
+        elif item.item_type == ItemType.webcast:
+            docs.webcast_link = item.link
+            docs.webcast_title = _make_title(year, quarter, "webcast", item.title)
+        elif item.item_type == ItemType.transcript:
+            docs.transcript = _resolve_link(item.pdf_url, item.link)
+            docs.transcript_title = _make_title(year, quarter, "transcript", item.title)
+
+    years = [YearlyData(year=y, quarters=q) for y, q in sorted(years_dict.items())]
 
     return ScrapeResponse(
         source_url=source_url,
         ir_page_url=ir_url,
         items=items,
+        years=years,
         message=f"Downloaded {len(items)} PDF(s). (playwright={used_playwright})",
+        playwright_used=used_playwright,
+        playwright_error=playwright_error,
     )
 
 

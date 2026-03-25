@@ -16,6 +16,8 @@ PRESS_RELEASE_KEYWORDS = [
     "press-release",
     "news release",
     "media release",
+    "earnings release",
+    "release",
     "newsroom",
     "news",
     "announcements",
@@ -43,6 +45,15 @@ PRESENTATION_KEYWORDS = [
     "conference",
     "roadshow",
     "analyst",
+]
+
+# Keywords that identify a transcript link
+TRANSCRIPT_KEYWORDS = [
+    "transcript",
+    "earnings call transcript",
+    "conference call transcript",
+    "webcast transcript",
+    "audio transcript",
 ]
 
 
@@ -73,12 +84,14 @@ def _is_audio_href(href: str) -> bool:
 
 
 def _classify_link(text: str, href: str) -> str:
-    """Return 'press_release', 'presentation', 'webcast', or 'unknown'."""
+    """Return 'press_release', 'presentation', 'webcast', 'transcript', or 'unknown'."""
     combined = (text + " " + href).lower()
     if any(kw in combined for kw in PRESS_RELEASE_KEYWORDS):
         return "press_release"
     if any(kw in combined for kw in WEBCAST_KEYWORDS):
         return "webcast"
+    if any(kw in combined for kw in TRANSCRIPT_KEYWORDS):
+        return "transcript"
     if any(kw in combined for kw in PRESENTATION_KEYWORDS):
         return "presentation"
     # Treat direct PDF links as potential documents (handle '?disposition=inline')

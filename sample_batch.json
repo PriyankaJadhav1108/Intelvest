@@ -1,0 +1,44 @@
+{
+  "batch": [
+    {
+      "ticker": "MMM",
+      "url": "https://investors.3m.com/financials/quarterly-results/default.aspx"
+    },
+    {
+      "ticker": "BLK",
+      "url": "https://ir.blackrock.com/financials/quarterly-results/default.aspx"
+    },
+    {
+      "ticker": "AXP",
+      "url": "https://ir.americanexpress.com/financials/quarterly-results/default.aspx"
+    },
+    {
+      "ticker": "BAC",
+      "url": "https://investor.bankofamerica.com/financials/quarterly-results/default.aspx"
+    },
+    {
+      "ticker": "CAT",
+      "url": "https://investors.caterpillar.com/financials/quarterly-results/default.aspx"
+    },
+    {
+      "ticker": "JNJ",
+      "url": "https://investor.jnj.com/financials/quarterly-results/default.aspx"
+    },
+    {
+      "ticker": "ALTR",
+      "url": "https://investors.alterainfra.com/home/default.aspx"
+    },
+    {
+      "ticker": "AMP",
+      "url": "https://ir.ameriprise.com/financials/quarterly-results/default.aspx"
+    },
+    {
+      "ticker": "ACN",
+      "url": "https://investor.accenture.com/financials/quarterly-results/default.aspx"
+    },
+    {
+      "ticker": "ACE",
+      "url": "https://investors.chubb.com/home/default.aspx"
+    }
+  ]
+}
